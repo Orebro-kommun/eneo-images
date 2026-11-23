@@ -1,0 +1,170 @@
+name: Build Örebro images
+
+# Builds Eneo images from a branch in Orebro-kommun/eneo and publishes them to
+# ghcr.io/orebro-kommun. Runs here, not in the fork, so the fork can keep
+# GitHub Actions turned off.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch in Orebro-kommun/eneo (orebro/develop or orebro/release-X.Y)
+        required: true
+        default: orebro/develop
+
+run-name: Build ${{ inputs.ref }}
+
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Orebro-kommun/eneo
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      revision: ${{ steps.version.outputs.revision }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Name the build after what it is built on
+        id: version
+        env:
+          REF: ${{ inputs.ref }}
+          RUN: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          if [[ "$REF" == orebro/release-* ]]; then
+            # The project's release the branch is built on: 2.3.2-orebro.4
+            tag="$(git describe --tags --abbrev=0 --match 'v*')"
+            base="$tag"
+            version="${tag#v}-orebro.$RUN"
+          else
+            # The commit in the project's develop the branch is built on: develop-0b25995-orebro.4
+            base="$(git merge-base HEAD origin/develop)"
+            version="develop-$(git rev-parse --short=7 "$base")-orebro.$RUN"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "revision=$revision" >>"$GITHUB_OUTPUT"
+          {
+            echo "## $version"
+            echo
+            echo "- Branch: \`$REF\` at \`$revision\`"
+            echo "- Built on: \`$base\`"
+            echo
+            echo "### Patches on top of the project"
+            echo
+            echo '```'
+            git log --merges --first-parent --oneline "$base..HEAD"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    env:
+      COMPONENT: ${{ matrix.component }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      REVISION: ${{ needs.plan.outputs.revision }}
+      IMAGE: ghcr.io/orebro-kommun/eneo-${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.revision }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # The version steps follow the project's application_image.yml.
+      - name: Inject backend version
+        if: matrix.component == 'backend'
+        run: ./scripts/inject-backend-version.sh "$VERSION"
+      - name: Prepare frontend for this version
+        if: matrix.component == 'frontend'
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 6G /mnt/eneo-frontend.swap
+          sudo chmod 600 /mnt/eneo-frontend.swap
+          sudo mkswap /mnt/eneo-frontend.swap
+          sudo swapon /mnt/eneo-frontend.swap
+          jq --arg version "$VERSION" '.version = $version' frontend/apps/web/package.json >package.json.tmp
+          mv package.json.tmp frontend/apps/web/package.json
+          sed -i -E 's/^(  const version = ")[^"]*(";)/\1'"$VERSION"'\2/' frontend/packages/eneo-js/src/client/client.js
+          test "$(jq -r .version frontend/apps/web/package.json)" = "$VERSION"
+          grep -qF "  const version = \"$VERSION\";" frontend/packages/eneo-js/src/client/client.js
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          build-contexts: ${{ matrix.component == 'backend' && 'web=./frontend' || '' }}
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ env.REVISION }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ env.SOURCE_REPO }}
+          build-args: |
+            OTEL_SERVICE_VERSION=${{ env.VERSION }}
+            APP_VERSION=${{ env.VERSION }}
+            APP_REVISION=${{ env.REVISION }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: ${{ matrix.component != 'frontend' && format('type=gha,mode=max,scope={0}', matrix.component) || '' }}
+      - name: Release build disk space before the scan
+        run: |
+          set -euo pipefail
+          if [[ -f /mnt/eneo-frontend.swap ]]; then
+            sudo swapoff /mnt/eneo-frontend.swap
+            sudo rm /mnt/eneo-frontend.swap
+          fi
+          docker buildx prune --all --force
+          df -h /
+      # The project's scan covers its own images, not these.
+      - name: Block HIGH and CRITICAL vulnerabilities that have a fix
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true
+          output-format: table
+          grype-version: v0.117.0
+      - name: Report the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### $COMPONENT"
+            echo
+            echo "\`$IMAGE:$VERSION\`"
+            echo
+            echo "\`$IMAGE@$DIGEST\`"
+          } >>"$GITHUB_STEP_SUMMARY"
