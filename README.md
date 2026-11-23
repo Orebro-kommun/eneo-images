@@ -21,8 +21,9 @@ gh workflow run build-images.yml --repo Orebro-kommun/eneo-images -f ref=orebro/
 | `orebro/release-X.Y` | `<the project's version>-orebro.<run>` | Production |
 
 The run summary lists the version, the commit it is built on and the patches on top
-of the project. Both images are scanned with Grype, and the run fails on HIGH or
-CRITICAL vulnerabilities that have a fix.
+of the project. Both images are scanned with Grype. As in the project, the run
+fails on HIGH or CRITICAL vulnerabilities that have a fix in the frontend image,
+and only reports them for the backend image.
 
 ## Deploy
 

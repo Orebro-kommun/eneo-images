@@ -147,12 +147,12 @@ jobs:
           fi
           docker buildx prune --all --force
           df -h /
-      # The project's scan covers its own images, not these.
-      - name: Block HIGH and CRITICAL vulnerabilities that have a fix
+      # Same gate as the project's application_image.yml: only the frontend blocks.
+      - name: Scan for HIGH and CRITICAL vulnerabilities that have a fix
         uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
-          fail-build: true
+          fail-build: ${{ matrix.component == 'frontend' }}
           severity-cutoff: high
           only-fixed: true
           output-format: table
